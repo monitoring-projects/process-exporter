@@ -100,6 +100,6 @@ func piinfost(pid int, name string, c Counts, m Memory, f Filedesc, t int, s Sta
 	return IDInfo{
 		ID:      id,
 		Static:  static,
-		Metrics: Metrics{c, m, f, uint64(t), s, ""},
+		Metrics: Metrics{c, m, f, uint64(t), s, "", MemoryExt{}},
 	}
 }
