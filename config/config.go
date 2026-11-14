@@ -178,6 +178,10 @@ func (m andMatcher) Match(nacl common.ProcAttributes) bool {
 
 type Config struct {
 	MatchNamers FirstMatcher
+	// StaticNames are the group names that contain no template action. They
+	// are known before any process matches, so a group that never started can
+	// be reported with zero processes.
+	StaticNames []string
 }
 
 func (c *Config) UnmarshalYAML(unmarshal func(v interface{}) error) error {
@@ -261,6 +265,9 @@ func (r MatcherRules) ToConfig() (*Config, error) {
 			return nil, fmt.Errorf("bad name template %q: %v", nametmpl, err)
 		}
 
+		if matcher.Name != "" && !strings.Contains(matcher.Name, "{{") {
+			cfg.StaticNames = append(cfg.StaticNames, matcher.Name)
+		}
 		matchNamer := &matchNamer{matchers, templateNamer{tmpl}}
 		cfg.MatchNamers.matchers = append(cfg.MatchNamers.matchers, matchNamer)
 	}

@@ -199,6 +199,23 @@ func main() {
 		smaps = flag.Bool("gather-smaps", false,
 			"gather metrics from smaps_rollup, which contains proportional resident memory size. "+
 				"Off by default: reading it pauses the target process in proportion to its size (upstream #246, #360)")
+		memBreakdown = flag.Bool("gather-memory-breakdown", false,
+			"add anon, file, shmem, data, peak, pagetables and locked to namedprocess_namegroup_memory_bytes (from /proc/pid/status, no smaps)")
+		gatherDelay = flag.Bool("gather-delay", false,
+			"export namedprocess_namegroup_blkio_delay_seconds_total (time waiting for block IO)")
+		gatherLifecycle = flag.Bool("gather-lifecycle", false,
+			"export processes_started_total, processes_exited_total and newest_start_time_seconds per group")
+		mapsGroups = flag.String("maps.groups", "",
+			"regexp of group names whose /proc/pid/maps lines are counted (namedprocess_namegroup_map_count, namedprocess_vm_max_map_count)")
+		mapsEvery = flag.Duration("maps.interval", time.Minute, "how often the mappings are counted")
+		fdGroups  = flag.String("fd.groups", "",
+			"regexp of group names whose open file descriptors are broken down by type (namedprocess_namegroup_open_filedesc_by_type)")
+		fdEvery        = flag.Duration("fd.interval", 30*time.Second, "how often the fd types are counted")
+		exportMinRSS   = flag.Uint64("export.min-resident-bytes", 0, "export only groups with at least this much resident memory (0: all); see -export.hold")
+		exportMinCores = flag.Float64("export.min-cpu-cores", 0, "export only groups using at least this many CPU cores (0: all); see -export.hold")
+		exportHold     = flag.Duration("export.hold", 30*time.Minute, "keep exporting a group this long after it last passed the export thresholds")
+		reportMissing  = flag.Bool("report-missing", false,
+			"with -config.path: report namedprocess_namegroup_num_procs 0 for groups with a static name that never matched")
 		diagOn = flag.Bool("diagnose", false,
 			"sample selected groups over time, correlate the signals and expose symptoms and predictions (namedprocess_diag_*)")
 		diagGroups = flag.String("diagnose.groups", ".+",
@@ -217,9 +234,8 @@ func main() {
 		diagFDPerHour = flag.Float64("diagnose.fd-min-per-hour", 5, "minimum open fd floor growth for fd_leak")
 		diagR2        = flag.Float64("diagnose.r2-min", 0.8, "minimum R2 of a trend fit")
 		diagBusy      = flag.Float64("diagnose.busy-loop-cores", 0.9, "minimum steady cpu cores for cpu_busy_loop")
-		diagMaps      = flag.String("diagnose.maps-groups", "",
-			"regexp of group names whose /proc/pid/maps lines are counted (vs vm.max_map_count)")
-		diagMapsEvery = flag.Duration("diagnose.maps-interval", time.Minute, "how often the maps are counted")
+		diagMaps      = flag.String("diagnose.maps-groups", "", "deprecated alias of -maps.groups")
+		diagMapsEvery = flag.Duration("diagnose.maps-interval", 0, "deprecated alias of -maps.interval")
 		man           = flag.Bool("man", false,
 			"print manual")
 		configPath = flag.String("config.path", "",
@@ -252,6 +268,7 @@ func main() {
 	}
 
 	var matchnamer common.MatchNamer
+	var staticNames []string
 
 	if *configPath != "" {
 		if *nameMapping != "" || *procNames != "" {
@@ -264,6 +281,7 @@ func main() {
 		}
 		log.Printf("Reading metrics from %s based on %q", *procfsPath, *configPath)
 		matchnamer = cfg.MatchNamers
+		staticNames = cfg.StaticNames
 		if *debug {
 			log.Printf("using config matchnamer: %v", cfg.MatchNamers)
 		}
@@ -295,7 +313,25 @@ func main() {
 	}
 
 	var diagEngine *diagnose.Engine
-	var mapsRe *regexp.Regexp
+	var mapsRe, fdRe *regexp.Regexp
+	if *mapsGroups == "" {
+		*mapsGroups = *diagMaps
+	}
+	if *diagMapsEvery != 0 {
+		*mapsEvery = *diagMapsEvery
+	}
+	if *mapsGroups != "" {
+		var err error
+		if mapsRe, err = regexp.Compile(*mapsGroups); err != nil {
+			log.Fatalf("bad -maps.groups: %v", err)
+		}
+	}
+	if *fdGroups != "" {
+		var err error
+		if fdRe, err = regexp.Compile(*fdGroups); err != nil {
+			log.Fatalf("bad -fd.groups: %v", err)
+		}
+	}
 	if *diagOn {
 		gre, err := regexp.Compile(*diagGroups)
 		if err != nil {
@@ -305,11 +341,6 @@ func main() {
 		if *diagDetail != "" {
 			if dre, err = regexp.Compile(*diagDetail); err != nil {
 				log.Fatalf("bad -diagnose.detail-groups: %v", err)
-			}
-		}
-		if *diagMaps != "" {
-			if mapsRe, err = regexp.Compile(*diagMaps); err != nil {
-				log.Fatalf("bad -diagnose.maps-groups: %v", err)
 			}
 		}
 		dcfg := diagnose.Config{
@@ -340,7 +371,17 @@ func main() {
 			Diagnose:          diagEngine,
 			DiagnoseInterval:  *diagInterval,
 			MapsGroups:        mapsRe,
-			MapsInterval:      *diagMapsEvery,
+			MapsInterval:      *mapsEvery,
+			MemoryBreakdown:   *memBreakdown,
+			GatherDelay:       *gatherDelay,
+			GatherLifecycle:   *gatherLifecycle,
+			FDGroups:          fdRe,
+			FDInterval:        *fdEvery,
+			ExportMinResident: *exportMinRSS,
+			ExportMinCores:    *exportMinCores,
+			ExportHold:        *exportHold,
+			StaticNames:       staticNames,
+			ReportMissing:     *reportMissing,
 		},
 	)
 	if err != nil {

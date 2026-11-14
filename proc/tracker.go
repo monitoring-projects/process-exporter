@@ -465,7 +465,7 @@ func (t *Tracker) Update(iter Iter) (CollectErrors, []Update, error) {
 	for id, tproc := range t.tracked {
 		if tproc != nil {
 			tp = append(tp, tproc.getUpdate())
-			extras[tproc.groupName] = extraadd(extras[tproc.groupName], id.Pid, tproc.metrics)
+			extras[tproc.groupName] = extraadd(extras[tproc.groupName], id, tproc.static.StartTime, tproc.metrics)
 		}
 	}
 	t.extras = extras

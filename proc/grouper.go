@@ -19,6 +19,9 @@ type (
 		debug             bool
 		removeEmptyGroups bool
 		extras            map[string]GroupExtra
+		prevProcs         map[ID]procPrev
+		lifecycle         map[string]Lifecycle
+		primed            bool
 	}
 
 	// GroupExtra carries data used only by the diagnose engine. It is kept
@@ -27,6 +30,29 @@ type (
 		Ext        MemoryExt
 		FDLimitMin uint64
 		Pids       []int
+		Procs      []ProcExtra
+		// NewestStart is the start time of the newest process of the group.
+		NewestStart time.Time
+	}
+
+	// ProcExtra is the per-process data needed to accumulate lifecycle and
+	// delay counters in the Grouper.
+	ProcExtra struct {
+		ID              ID
+		BlkIODelayTicks uint64
+	}
+
+	// Lifecycle holds monotonic per-group counters derived from the set of
+	// tracked processes: how many were started and how many exited since the
+	// exporter began watching, and the accumulated block IO delay.
+	Lifecycle struct {
+		Started, Exited   uint64
+		BlkIODelaySeconds float64
+	}
+
+	procPrev struct {
+		group string
+		delay uint64
 	}
 
 	// GroupByName maps group name to group metrics.
@@ -66,13 +92,19 @@ func NewGrouper(namer common.MatchNamer, trackChildren, trackThreads, recheck bo
 		tracker:           NewTracker(namer, trackChildren, recheck, recheckTimeLimit, debug),
 		debug:             debug,
 		removeEmptyGroups: removeEmptyGroups,
+		prevProcs:         make(map[ID]procPrev),
+		lifecycle:         make(map[string]Lifecycle),
 	}
 	return &g
 }
 
-func extraadd(x GroupExtra, pid int, m Metrics) GroupExtra {
-	if pid != 0 {
-		x.Pids = append(x.Pids, pid)
+func extraadd(x GroupExtra, id ID, start time.Time, m Metrics) GroupExtra {
+	if id.Pid != 0 {
+		x.Pids = append(x.Pids, id.Pid)
+	}
+	x.Procs = append(x.Procs, ProcExtra{ID: id, BlkIODelayTicks: m.Ext.BlkIODelayTicks})
+	if start.After(x.NewestStart) {
+		x.NewestStart = start
 	}
 	x.Ext.RssAnonBytes += m.Ext.RssAnonBytes
 	x.Ext.RssFileBytes += m.Ext.RssFileBytes
@@ -86,6 +118,47 @@ func extraadd(x GroupExtra, pid int, m Metrics) GroupExtra {
 	}
 	return x
 }
+
+// accumulate derives the lifecycle counters from the processes seen in the
+// last Update. The first Update only establishes the baseline, so processes
+// that already ran when the exporter started are not counted as started.
+func (g *Grouper) accumulate() {
+	cur := make(map[ID]procPrev, len(g.prevProcs))
+	for gname, x := range g.extras {
+		lc := g.lifecycle[gname]
+		for _, p := range x.Procs {
+			prev, seen := g.prevProcs[p.ID]
+			delta := p.BlkIODelayTicks
+			switch {
+			case seen && p.BlkIODelayTicks >= prev.delay:
+				delta = p.BlkIODelayTicks - prev.delay
+			case seen:
+				delta = 0
+			case g.primed:
+				lc.Started++
+			default:
+				delta = 0
+			}
+			lc.BlkIODelaySeconds += float64(delta) / userHZ
+			cur[p.ID] = procPrev{gname, p.BlkIODelayTicks}
+		}
+		g.lifecycle[gname] = lc
+	}
+	if g.primed {
+		for id, prev := range g.prevProcs {
+			if _, ok := cur[id]; !ok {
+				lc := g.lifecycle[prev.group]
+				lc.Exited++
+				g.lifecycle[prev.group] = lc
+			}
+		}
+	}
+	g.prevProcs = cur
+	g.primed = true
+}
+
+// Lifecycle returns the monotonic lifecycle counters per group.
+func (g *Grouper) Lifecycle() map[string]Lifecycle { return g.lifecycle }
 
 // Extras returns the diagnose-only data of the last Update.
 func (g *Grouper) Extras() map[string]GroupExtra { return g.extras }
@@ -153,6 +226,7 @@ func (g *Grouper) groups(tracked []Update) GroupByName {
 	}
 
 	g.extras = g.tracker.extras
+	g.accumulate()
 
 	// Add any accumulated counts to what was just observed,
 	// and update the accumulators.

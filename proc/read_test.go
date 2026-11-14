@@ -73,7 +73,7 @@ func TestReadFixture(t *testing.T) {
 	}
 
 	wantmetrics := Metrics{
-		Ext: MemoryExt{VmDataBytes: 10194944, VmHWMBytes: 8065024, VmPTEBytes: 49152},
+		Ext: MemoryExt{VmDataBytes: 10194944, VmHWMBytes: 8065024, VmPTEBytes: 49152, BlkIODelayTicks: 2},
 		Counts: Counts{
 			CPUUserTime:           0.1,
 			CPUSystemTime:         0.04,

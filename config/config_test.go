@@ -94,3 +94,18 @@ process_names:
 	c.Check(found, Equals, true)
 	c.Check(name, Equals, now.String())
 }
+
+func (s MySuite) TestStaticNames(c *C) {
+	cfg, err := GetConfig(`
+process_names:
+  - name: web
+    comm: [nginx]
+  - name: "{{.Comm}}"
+    cmdline: ['.+']
+  - name: "worker-{{.PID}}"
+    comm: [worker]
+  - exe: [foo]
+`, false)
+	c.Assert(err, IsNil)
+	c.Check(cfg.StaticNames, DeepEquals, []string{"web"})
+}

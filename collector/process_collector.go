@@ -94,6 +94,48 @@ var (
 		[]string{"groupname", "state"},
 		nil)
 
+	mapCountDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_map_count",
+		"number of memory mappings (lines of /proc/pid/maps), max over the processes of the group",
+		[]string{"groupname"},
+		nil)
+
+	vmMaxMapCountDesc = prometheus.NewDesc(
+		"namedprocess_vm_max_map_count",
+		"vm.max_map_count of the host",
+		nil,
+		nil)
+
+	blkioDelayDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_blkio_delay_seconds_total",
+		"aggregated block IO delay of the processes of the group (time spent waiting for block IO)",
+		[]string{"groupname"},
+		nil)
+
+	startedDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_processes_started_total",
+		"processes of the group started since the exporter began watching",
+		[]string{"groupname"},
+		nil)
+
+	exitedDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_processes_exited_total",
+		"processes of the group that exited since the exporter began watching",
+		[]string{"groupname"},
+		nil)
+
+	newestStartDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_newest_start_time_seconds",
+		"start time in seconds since 1970/01/01 of the newest process in the group",
+		[]string{"groupname"},
+		nil)
+
+	fdByTypeDesc = prometheus.NewDesc(
+		"namedprocess_namegroup_open_filedesc_by_type",
+		"open file descriptors of the selected groups by type (socket, pipe, anon_inode, infiniband, shm, memfd, device, procfs, file, other)",
+		[]string{"groupname", "type"},
+		nil)
+
 	scrapeErrorsDesc = prometheus.NewDesc(
 		"namedprocess_scrape_errors",
 		"general scrape errors: no proc metrics collected during a cycle",
@@ -178,6 +220,26 @@ type (
 		// MapsGroups selects groups whose /proc/pid/maps lines are counted.
 		MapsGroups   *regexp.Regexp
 		MapsInterval time.Duration
+
+		// MemoryBreakdown adds anon, file, shmem, data, peak, pagetables and
+		// locked to namedprocess_namegroup_memory_bytes (from /proc/pid/status).
+		MemoryBreakdown bool
+		// GatherDelay exports the block IO delay counter.
+		GatherDelay bool
+		// GatherLifecycle exports started/exited counters and the newest start time.
+		GatherLifecycle bool
+		// FDGroups selects groups whose open file descriptors are broken down by type.
+		FDGroups   *regexp.Regexp
+		FDInterval time.Duration
+		// Export filter: only groups with at least this much resident memory or
+		// CPU are exported, plus ExportHold after they last were.
+		ExportMinResident uint64
+		ExportMinCores    float64
+		ExportHold        time.Duration
+		// StaticNames are group names known in advance; with ReportMissing a
+		// group that never matched is reported with zero processes.
+		StaticNames   []string
+		ReportMissing bool
 	}
 
 	NamedProcessCollector struct {
@@ -197,6 +259,18 @@ type (
 		mapsLast             time.Time
 		mapsCache            map[string]int
 		procfs               string
+
+		memBreakdown  bool
+		gatherDelay   bool
+		lifecycle     bool
+		fdGroups      *regexp.Regexp
+		fdInterval    time.Duration
+		fdLast        time.Time
+		fdCache       map[string]map[string]int
+		filter        *exportFilter
+		staticNames   []string
+		reportMissing bool
+		maxMapCount   float64
 	}
 )
 
@@ -221,6 +295,19 @@ func NewProcessCollector(options ProcessCollectorOption) (*NamedProcessCollector
 		mapsInterval: options.MapsInterval,
 		mapsCache:    map[string]int{},
 		procfs:       options.ProcFSPath,
+
+		memBreakdown:  options.MemoryBreakdown,
+		gatherDelay:   options.GatherDelay,
+		lifecycle:     options.GatherLifecycle,
+		fdGroups:      options.FDGroups,
+		fdInterval:    options.FDInterval,
+		fdCache:       map[string]map[string]int{},
+		filter:        newExportFilter(options.ExportMinResident, options.ExportMinCores, options.ExportHold),
+		staticNames:   options.StaticNames,
+		reportMissing: options.ReportMissing,
+	}
+	if options.MapsGroups != nil {
+		p.maxMapCount = readFloatFile(options.ProcFSPath + "/sys/vm/max_map_count")
 	}
 
 	colErrs, _, err := p.Update(p.source.AllProcs())
@@ -263,6 +350,13 @@ func (p *NamedProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- threadMajorPageFaultsDesc
 	ch <- threadMinorPageFaultsDesc
 	ch <- threadContextSwitchesDesc
+	ch <- mapCountDesc
+	ch <- vmMaxMapCountDesc
+	ch <- blkioDelayDesc
+	ch <- startedDesc
+	ch <- exitedDesc
+	ch <- newestStartDesc
+	ch <- fdByTypeDesc
 	if p.diag != nil {
 		p.diag.Describe(ch)
 	}
@@ -308,10 +402,37 @@ func (p *NamedProcessCollector) sample() {
 }
 
 func (p *NamedProcessCollector) observe(groups proc.GroupByName) {
+	maps := p.maps(groups)
+	p.fdTypes()
 	if p.diag == nil {
 		return
 	}
-	p.diag.Observe(time.Now(), groups, p.Grouper.Extras(), p.maps(groups))
+	p.diag.Observe(time.Now(), groups, p.Grouper.Extras(), maps)
+}
+
+// fdTypes refreshes the file descriptor type breakdown of the selected groups.
+func (p *NamedProcessCollector) fdTypes() {
+	if p.fdGroups == nil || time.Since(p.fdLast) < p.fdInterval {
+		return
+	}
+	p.fdLast = time.Now()
+	res := map[string]map[string]int{}
+	for name, x := range p.Grouper.Extras() {
+		if p.fdGroups.MatchString(name) {
+			res[name] = countFDTypes(p.procfs, x.Pids)
+		}
+	}
+	p.fdCache = res
+}
+
+func readFloatFile(path string) float64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var v float64
+	fmt.Sscan(strings.TrimSpace(string(b)), &v)
+	return v
 }
 
 // maps counts the mappings of the processes of the selected groups. Reading
@@ -365,7 +486,14 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 		log.Printf("error reading procs: %v", err)
 	} else {
 		p.observe(groups)
+		now := time.Now()
+		p.filter.forget(now)
+		extras, lifecycle := p.Grouper.Extras(), p.Grouper.Lifecycle()
 		for gname, gcounts := range groups {
+			if !p.filter.allow(gname, gcounts.Memory.ResidentBytes, gcounts.CPUUserTime+gcounts.CPUSystemTime, now) {
+				continue
+			}
+			rawName := gname
 			gname = utf8(gname)
 			ch <- prometheus.MustNewConstMetric(numprocsDesc,
 				prometheus.GaugeValue, float64(gcounts.Procs), gname)
@@ -417,6 +545,38 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 					prometheus.GaugeValue, float64(count), gname, utf8(wchan))
 			}
 
+			if x, ok := extras[rawName]; ok && p.memBreakdown {
+				for _, mt := range []struct {
+					name string
+					v    uint64
+				}{{"anon", x.Ext.RssAnonBytes}, {"file", x.Ext.RssFileBytes}, {"shmem", x.Ext.RssShmemBytes},
+					{"data", x.Ext.VmDataBytes}, {"peak", x.Ext.VmHWMBytes}, {"pagetables", x.Ext.VmPTEBytes},
+					{"locked", x.Ext.VmLckBytes}} {
+					ch <- prometheus.MustNewConstMetric(membytesDesc,
+						prometheus.GaugeValue, float64(mt.v), gname, mt.name)
+				}
+			}
+			if p.gatherDelay {
+				ch <- prometheus.MustNewConstMetric(blkioDelayDesc,
+					prometheus.CounterValue, lifecycle[rawName].BlkIODelaySeconds, gname)
+			}
+			if p.lifecycle {
+				ch <- prometheus.MustNewConstMetric(startedDesc,
+					prometheus.CounterValue, float64(lifecycle[rawName].Started), gname)
+				ch <- prometheus.MustNewConstMetric(exitedDesc,
+					prometheus.CounterValue, float64(lifecycle[rawName].Exited), gname)
+				if x, ok := extras[rawName]; ok && !x.NewestStart.IsZero() {
+					ch <- prometheus.MustNewConstMetric(newestStartDesc,
+						prometheus.GaugeValue, float64(x.NewestStart.Unix()), gname)
+				}
+			}
+			if m, ok := p.mapsCache[rawName]; ok && p.mapsGroups != nil {
+				ch <- prometheus.MustNewConstMetric(mapCountDesc, prometheus.GaugeValue, float64(m), gname)
+			}
+			for typ, n := range p.fdCache[rawName] {
+				ch <- prometheus.MustNewConstMetric(fdByTypeDesc, prometheus.GaugeValue, float64(n), gname, typ)
+			}
+
 			if p.smaps {
 				ch <- prometheus.MustNewConstMetric(membytesDesc,
 					prometheus.GaugeValue, float64(gcounts.Memory.ProportionalBytes), gname, "proportionalResident")
@@ -454,6 +614,16 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 						prometheus.CounterValue, float64(thr.CtxSwitchNonvoluntary),
 						gname, utf8(thr.Name), "nonvoluntary")
 				}
+			}
+		}
+	}
+	if p.mapsGroups != nil && p.maxMapCount > 0 {
+		ch <- prometheus.MustNewConstMetric(vmMaxMapCountDesc, prometheus.GaugeValue, p.maxMapCount)
+	}
+	if p.reportMissing && err == nil {
+		for _, n := range p.staticNames {
+			if _, ok := groups[n]; !ok {
+				ch <- prometheus.MustNewConstMetric(numprocsDesc, prometheus.GaugeValue, 0, utf8(n))
 			}
 		}
 	}

@@ -322,6 +322,31 @@ state(3) from /proc/[pid]/stat.
 
 The extra label `state` can have these values: `Running`, `Sleeping`, `Waiting`, `Zombie`, `Other`.
 
+## Optional group metrics
+
+All are off by default so cardinality stays as before. Each is enabled by a flag.
+
+| Flag | Series | Use |
+|---|---|---|
+| `-gather-memory-breakdown` | `namedprocess_namegroup_memory_bytes{memtype="anon\|file\|shmem\|data\|peak\|pagetables\|locked"}` | Shared memory, anonymous vs file-backed resident memory, private address space and peak, from `/proc/<pid>/status` (no smaps, no pause of the target). |
+| `-gather-delay` | `namedprocess_namegroup_blkio_delay_seconds_total` | Time spent waiting for block IO (per-process IO wait). Needs `delayacct` support in the kernel; zero otherwise. |
+| `-gather-lifecycle` | `..._processes_started_total`, `..._processes_exited_total`, `..._newest_start_time_seconds` | Restarts and churn of a group, counted from when the exporter started watching. |
+| `-maps.groups REGEXP`, `-maps.interval` | `namedprocess_namegroup_map_count`, `namedprocess_vm_max_map_count` | Number of memory mappings (lines of `/proc/<pid>/maps`, maximum over the group) against `vm.max_map_count`. Reading maps briefly takes the target's mmap lock, so select groups. |
+| `-fd.groups REGEXP`, `-fd.interval` | `namedprocess_namegroup_open_filedesc_by_type{type="socket\|pipe\|anon_inode\|infiniband\|shm\|memfd\|device\|procfs\|file\|other"}` | Which kind of descriptor grows. Bounded cardinality (fixed type set). |
+| `-report-missing` (with `-config.path`) | `namedprocess_namegroup_num_procs 0` | Groups with a static `name:` (no template) that never matched are reported with zero processes, so "process not running" alerts work. |
+
+Reading `/proc/<pid>/fd`, `io` and `maps` of other users' processes needs root or `CAP_SYS_PTRACE` (and `CAP_DAC_READ_SEARCH`).
+
+`-gather-smaps` now defaults to **false**: reading `smaps_rollup` pauses the target process in proportion to its memory size.
+
+## Limiting what is exported
+
+`-export.min-resident-bytes N` and `-export.min-cpu-cores X` export only groups whose resident memory or CPU usage reaches the threshold, and keep exporting them for `-export.hold` (default 30m) after they last did, so series do not flap. Without the flags every group is exported as before.
+
+## Diagnose engine
+
+`-diagnose` samples the groups in memory and exposes derived `namedprocess_diag_*` series instead of requiring every raw series to be stored: symptoms (`memory_leak_suspected`, `address_space_leak`, `fd_leak`, `thread_leak`, `cpu_busy_loop`, `blocked_io`, `restart_loop`, `maps_near_limit`, `swapping`, fault storms, zombies), a verdict with its driver and rounded evidence as labels, trend slopes, correlations and predicted time to exhaustion. A healthy group emits no per-group series; detail series appear for groups with an active symptom or matching `-diagnose.detail-groups`. Method: per-bucket minimums (removes per-cycle sawtooth), least-squares trends with R2, a sustained-growth check that rejects startup ramps, and a work-vs-time driver from the correlation between floor growth and CPU work. See `diagnose/` and its tests (including a replay of anonymised real data).
+
 ## Group Thread Metrics
 
 Since publishing thread metrics adds a lot of overhead, use the `-threads` command-line argument to disable them, 

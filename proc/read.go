@@ -68,6 +68,8 @@ type (
 		VmHWMBytes    uint64
 		VmPTEBytes    uint64
 		VmLckBytes    uint64
+		// BlkIODelayTicks is the aggregated block IO delay (clock ticks) from /proc/pid/stat.
+		BlkIODelayTicks uint64
 	}
 
 	// Filedesc describes a proc's file descriptor usage and soft limit.
@@ -531,13 +533,14 @@ func (p proc) GetMetrics() (Metrics, int, error) {
 	}
 
 	ext := MemoryExt{
-		RssAnonBytes:  status.RssAnon,
-		RssFileBytes:  status.RssFile,
-		RssShmemBytes: status.RssShmem,
-		VmDataBytes:   status.VmData,
-		VmHWMBytes:    status.VmHWM,
-		VmPTEBytes:    status.VmPTE,
-		VmLckBytes:    status.VmLck,
+		RssAnonBytes:    status.RssAnon,
+		RssFileBytes:    status.RssFile,
+		RssShmemBytes:   status.RssShmem,
+		VmDataBytes:     status.VmData,
+		VmHWMBytes:      status.VmHWM,
+		VmPTEBytes:      status.VmPTE,
+		VmLckBytes:      status.VmLck,
+		BlkIODelayTicks: stat.DelayAcctBlkIOTicks,
 	}
 
 	return Metrics{
