@@ -1,10 +1,16 @@
 package collector
 
 import (
+	"bufio"
+	"fmt"
 	"log"
+	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	common "github.com/Monitoring-Projects/process-exporter"
+	"github.com/Monitoring-Projects/process-exporter/diagnose"
 	"github.com/Monitoring-Projects/process-exporter/proc"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -165,6 +171,13 @@ type (
 		RecheckTimeLimit  time.Duration
 		Debug             bool
 		RemoveEmptyGroups bool
+		// Diagnose, when non-nil, samples the groups and exposes symptoms.
+		Diagnose *diagnose.Engine
+		// DiagnoseInterval is the background sampling interval (0: scrape only).
+		DiagnoseInterval time.Duration
+		// MapsGroups selects groups whose /proc/pid/maps lines are counted.
+		MapsGroups   *regexp.Regexp
+		MapsInterval time.Duration
 	}
 
 	NamedProcessCollector struct {
@@ -177,6 +190,13 @@ type (
 		scrapeProcReadErrors int
 		scrapePartialErrors  int
 		debug                bool
+		diag                 *diagnose.Engine
+		diagInterval         time.Duration
+		mapsGroups           *regexp.Regexp
+		mapsInterval         time.Duration
+		mapsLast             time.Time
+		mapsCache            map[string]int
+		procfs               string
 	}
 )
 
@@ -194,6 +214,13 @@ func NewProcessCollector(options ProcessCollectorOption) (*NamedProcessCollector
 		threads:    options.Threads,
 		smaps:      options.GatherSMaps,
 		debug:      options.Debug,
+
+		diag:         options.Diagnose,
+		diagInterval: options.DiagnoseInterval,
+		mapsGroups:   options.MapsGroups,
+		mapsInterval: options.MapsInterval,
+		mapsCache:    map[string]int{},
+		procfs:       options.ProcFSPath,
 	}
 
 	colErrs, _, err := p.Update(p.source.AllProcs())
@@ -236,6 +263,9 @@ func (p *NamedProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- threadMajorPageFaultsDesc
 	ch <- threadMinorPageFaultsDesc
 	ch <- threadContextSwitchesDesc
+	if p.diag != nil {
+		p.diag.Describe(ch)
+	}
 }
 
 // Collect implements prometheus.Collector.
@@ -246,12 +276,86 @@ func (p *NamedProcessCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (p *NamedProcessCollector) start() {
-	for req := range p.scrapeChan {
-		ch := req.results
-		p.scrape(ch)
-		req.done <- struct{}{}
+	var tick <-chan time.Time
+	if p.diag != nil && p.diagInterval > 0 {
+		t := time.NewTicker(p.diagInterval)
+		defer t.Stop()
+		tick = t.C
+	}
+	for {
+		select {
+		case req, ok := <-p.scrapeChan:
+			if !ok {
+				return
+			}
+			p.scrape(req.results)
+			req.done <- struct{}{}
+		case <-tick:
+			p.sample()
+		}
 	}
 }
+
+// sample feeds the diagnose engine between scrapes, without emitting metrics.
+func (p *NamedProcessCollector) sample() {
+	permErrs, groups, err := p.Update(p.source.AllProcs())
+	p.scrapePartialErrors += permErrs.Partial
+	if err != nil {
+		p.scrapeErrors++
+		return
+	}
+	p.observe(groups)
+}
+
+func (p *NamedProcessCollector) observe(groups proc.GroupByName) {
+	if p.diag == nil {
+		return
+	}
+	p.diag.Observe(time.Now(), groups, p.Grouper.Extras(), p.maps(groups))
+}
+
+// maps counts the mappings of the processes of the selected groups. Reading
+// /proc/pid/maps takes the target's mmap lock briefly, so it runs at most once
+// per interval and only for the selected groups.
+func (p *NamedProcessCollector) maps(groups proc.GroupByName) map[string]int {
+	if p.mapsGroups == nil {
+		return nil
+	}
+	if time.Since(p.mapsLast) < p.mapsInterval {
+		return p.mapsCache
+	}
+	p.mapsLast = time.Now()
+	res := map[string]int{}
+	for name, x := range p.Grouper.Extras() {
+		if !p.mapsGroups.MatchString(name) {
+			continue
+		}
+		for _, pid := range x.Pids {
+			if n := countLines(fmt.Sprintf("%s/%d/maps", p.procfs, pid)); n > res[name] {
+				res[name] = n
+			}
+		}
+	}
+	p.mapsCache = res
+	return res
+}
+
+func countLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	n := 0
+	for sc.Scan() {
+		n++
+	}
+	return n
+}
+
+func utf8(s string) string { return strings.ToValidUTF8(s, "\uFFFD") }
 
 func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 	permErrs, groups, err := p.Update(p.source.AllProcs())
@@ -260,7 +364,9 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 		p.scrapeErrors++
 		log.Printf("error reading procs: %v", err)
 	} else {
+		p.observe(groups)
 		for gname, gcounts := range groups {
+			gname = utf8(gname)
 			ch <- prometheus.MustNewConstMetric(numprocsDesc,
 				prometheus.GaugeValue, float64(gcounts.Procs), gname)
 			ch <- prometheus.MustNewConstMetric(membytesDesc,
@@ -269,8 +375,10 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, float64(gcounts.Memory.VirtualBytes), gname, "virtual")
 			ch <- prometheus.MustNewConstMetric(membytesDesc,
 				prometheus.GaugeValue, float64(gcounts.Memory.VmSwapBytes), gname, "swapped")
-			ch <- prometheus.MustNewConstMetric(startTimeDesc,
-				prometheus.GaugeValue, float64(gcounts.OldestStartTime.Unix()), gname)
+			if !gcounts.OldestStartTime.IsZero() {
+				ch <- prometheus.MustNewConstMetric(startTimeDesc,
+					prometheus.GaugeValue, float64(gcounts.OldestStartTime.Unix()), gname)
+			}
 			ch <- prometheus.MustNewConstMetric(openFDsDesc,
 				prometheus.GaugeValue, float64(gcounts.OpenFDs), gname)
 			ch <- prometheus.MustNewConstMetric(worstFDRatioDesc,
@@ -306,7 +414,7 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 
 			for wchan, count := range gcounts.Wchans {
 				ch <- prometheus.MustNewConstMetric(threadWchanDesc,
-					prometheus.GaugeValue, float64(count), gname, wchan)
+					prometheus.GaugeValue, float64(count), gname, utf8(wchan))
 			}
 
 			if p.smaps {
@@ -320,34 +428,37 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 				for _, thr := range gcounts.Threads {
 					ch <- prometheus.MustNewConstMetric(threadCountDesc,
 						prometheus.GaugeValue, float64(thr.NumThreads),
-						gname, thr.Name)
+						gname, utf8(thr.Name))
 					ch <- prometheus.MustNewConstMetric(threadCpuSecsDesc,
 						prometheus.CounterValue, float64(thr.CPUUserTime),
-						gname, thr.Name, "user")
+						gname, utf8(thr.Name), "user")
 					ch <- prometheus.MustNewConstMetric(threadCpuSecsDesc,
 						prometheus.CounterValue, float64(thr.CPUSystemTime),
-						gname, thr.Name, "system")
+						gname, utf8(thr.Name), "system")
 					ch <- prometheus.MustNewConstMetric(threadIoBytesDesc,
 						prometheus.CounterValue, float64(thr.ReadBytes),
-						gname, thr.Name, "read")
+						gname, utf8(thr.Name), "read")
 					ch <- prometheus.MustNewConstMetric(threadIoBytesDesc,
 						prometheus.CounterValue, float64(thr.WriteBytes),
-						gname, thr.Name, "write")
+						gname, utf8(thr.Name), "write")
 					ch <- prometheus.MustNewConstMetric(threadMajorPageFaultsDesc,
 						prometheus.CounterValue, float64(thr.MajorPageFaults),
-						gname, thr.Name)
+						gname, utf8(thr.Name))
 					ch <- prometheus.MustNewConstMetric(threadMinorPageFaultsDesc,
 						prometheus.CounterValue, float64(thr.MinorPageFaults),
-						gname, thr.Name)
+						gname, utf8(thr.Name))
 					ch <- prometheus.MustNewConstMetric(threadContextSwitchesDesc,
 						prometheus.CounterValue, float64(thr.CtxSwitchVoluntary),
-						gname, thr.Name, "voluntary")
+						gname, utf8(thr.Name), "voluntary")
 					ch <- prometheus.MustNewConstMetric(threadContextSwitchesDesc,
 						prometheus.CounterValue, float64(thr.CtxSwitchNonvoluntary),
-						gname, thr.Name, "nonvoluntary")
+						gname, utf8(thr.Name), "nonvoluntary")
 				}
 			}
 		}
+	}
+	if p.diag != nil {
+		p.diag.Collect(ch)
 	}
 	ch <- prometheus.MustNewConstMetric(scrapeErrorsDesc,
 		prometheus.CounterValue, float64(p.scrapeErrors))

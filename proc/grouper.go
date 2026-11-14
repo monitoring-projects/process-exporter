@@ -18,6 +18,15 @@ type (
 		threadAccum       map[string]map[string]Threads
 		debug             bool
 		removeEmptyGroups bool
+		extras            map[string]GroupExtra
+	}
+
+	// GroupExtra carries data used only by the diagnose engine. It is kept
+	// out of Group so existing consumers and tests are unaffected.
+	GroupExtra struct {
+		Ext        MemoryExt
+		FDLimitMin uint64
+		Pids       []int
 	}
 
 	// GroupByName maps group name to group metrics.
@@ -60,6 +69,26 @@ func NewGrouper(namer common.MatchNamer, trackChildren, trackThreads, recheck bo
 	}
 	return &g
 }
+
+func extraadd(x GroupExtra, pid int, m Metrics) GroupExtra {
+	if pid != 0 {
+		x.Pids = append(x.Pids, pid)
+	}
+	x.Ext.RssAnonBytes += m.Ext.RssAnonBytes
+	x.Ext.RssFileBytes += m.Ext.RssFileBytes
+	x.Ext.RssShmemBytes += m.Ext.RssShmemBytes
+	x.Ext.VmDataBytes += m.Ext.VmDataBytes
+	x.Ext.VmHWMBytes += m.Ext.VmHWMBytes
+	x.Ext.VmPTEBytes += m.Ext.VmPTEBytes
+	x.Ext.VmLckBytes += m.Ext.VmLckBytes
+	if m.Filedesc.Limit > 0 && (x.FDLimitMin == 0 || m.Filedesc.Limit < x.FDLimitMin) {
+		x.FDLimitMin = m.Filedesc.Limit
+	}
+	return x
+}
+
+// Extras returns the diagnose-only data of the last Update.
+func (g *Grouper) Extras() map[string]GroupExtra { return g.extras }
 
 func groupadd(grp Group, ts Update) Group {
 	var zeroTime time.Time
@@ -122,6 +151,8 @@ func (g *Grouper) groups(tracked []Update) GroupByName {
 				append(threadsByGroup[update.GroupName], update.Threads...)
 		}
 	}
+
+	g.extras = g.tracker.extras
 
 	// Add any accumulated counts to what was just observed,
 	// and update the accumulators.

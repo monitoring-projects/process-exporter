@@ -57,6 +57,19 @@ type (
 		ProportionalSwapBytes uint64
 	}
 
+	// MemoryExt holds the optional /proc/pid/status memory breakdown used by
+	// the diagnose engine. It is kept apart from Memory so the exported
+	// per-group series stay unchanged.
+	MemoryExt struct {
+		RssAnonBytes  uint64
+		RssFileBytes  uint64
+		RssShmemBytes uint64
+		VmDataBytes   uint64
+		VmHWMBytes    uint64
+		VmPTEBytes    uint64
+		VmLckBytes    uint64
+	}
+
 	// Filedesc describes a proc's file descriptor usage and soft limit.
 	Filedesc struct {
 		// Open is the count of open file descriptors, -1 if unknown.
@@ -82,6 +95,7 @@ type (
 		NumThreads uint64
 		States
 		Wchan string
+		Ext   MemoryExt
 	}
 
 	// Thread contains per-thread data.
@@ -516,9 +530,20 @@ func (p proc) GetMetrics() (Metrics, int, error) {
 		}
 	}
 
+	ext := MemoryExt{
+		RssAnonBytes:  status.RssAnon,
+		RssFileBytes:  status.RssFile,
+		RssShmemBytes: status.RssShmem,
+		VmDataBytes:   status.VmData,
+		VmHWMBytes:    status.VmHWM,
+		VmPTEBytes:    status.VmPTE,
+		VmLckBytes:    status.VmLck,
+	}
+
 	return Metrics{
 		Counts: counts,
 		Memory: memory,
+		Ext:    ext,
 		Filedesc: Filedesc{
 			Open:  int64(numfds),
 			Limit: uint64(limits.OpenFiles),

@@ -17,6 +17,7 @@ import (
 	common "github.com/Monitoring-Projects/process-exporter"
 	"github.com/Monitoring-Projects/process-exporter/collector"
 	"github.com/Monitoring-Projects/process-exporter/config"
+	"github.com/Monitoring-Projects/process-exporter/diagnose"
 	"github.com/ncabatoff/fakescraper"
 	"github.com/prometheus/client_golang/prometheus"
 	verCollector "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -143,6 +144,35 @@ func (nmr *nameMapperRegex) MatchAndName(nacl common.ProcAttributes) (bool, stri
 	return false, ""
 }
 
+func readFloat(path string) float64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var v float64
+	fmt.Sscan(strings.TrimSpace(string(b)), &v)
+	return v
+}
+
+// memAvailable returns a function reading MemAvailable (bytes) from the
+// procfs of the host, used to turn a memory trend into a time to exhaustion.
+func memAvailable(procfs string) func() float64 {
+	return func() float64 {
+		b, err := os.ReadFile(procfs + "/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, l := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(l, "MemAvailable:") {
+				var kb float64
+				fmt.Sscanf(strings.TrimPrefix(l, "MemAvailable:"), "%f", &kb)
+				return kb * 1024
+			}
+		}
+		return 0
+	}
+}
+
 func init() {
 	promVersion.Version = version
 	prometheus.MustRegister(verCollector.NewCollector("process_exporter"))
@@ -166,9 +196,31 @@ func main() {
 			"if a proc is tracked, track with it any children that aren't part of their own group")
 		threads = flag.Bool("threads", true,
 			"report on per-threadname metrics as well")
-		smaps = flag.Bool("gather-smaps", true,
-			"gather metrics from smaps file, which contains proportional resident memory size")
-		man = flag.Bool("man", false,
+		smaps = flag.Bool("gather-smaps", false,
+			"gather metrics from smaps_rollup, which contains proportional resident memory size. "+
+				"Off by default: reading it pauses the target process in proportion to its size (upstream #246, #360)")
+		diagOn = flag.Bool("diagnose", false,
+			"sample selected groups over time, correlate the signals and expose symptoms and predictions (namedprocess_diag_*)")
+		diagGroups = flag.String("diagnose.groups", ".+",
+			"regexp of group names that are analysed in memory")
+		diagDetail = flag.String("diagnose.detail-groups", "",
+			"regexp of group names for which the detailed diag series (trends, rates, memory breakdown, correlations) are always exposed; other groups expose them only while a symptom is active")
+		diagInterval = flag.Duration("diagnose.interval", 15*time.Second,
+			"background sampling interval of the analysed groups (0: sample on scrapes only)")
+		diagWindow    = flag.Duration("diagnose.window", 30*time.Minute, "fine sample window")
+		diagFloorSpan = flag.Duration("diagnose.floor-span", 6*time.Hour, "history kept for trend fits")
+		diagBucket    = flag.Duration("diagnose.bucket", 5*time.Minute, "floor bucket size (minimum per bucket removes per-cycle sawtooth)")
+		diagMinSpan   = flag.Duration("diagnose.min-span", time.Hour, "minimum observed span before a trend is reported")
+		diagHold      = flag.Duration("diagnose.hold", 10*time.Minute, "keep a symptom active this long after it was last detected")
+		diagLeakMiB   = flag.Float64("diagnose.leak-min-mib-per-hour", 5, "minimum anonymous RSS floor growth for memory_leak_suspected")
+		diagVMMiB     = flag.Float64("diagnose.vm-growth-min-mib-per-hour", 512, "minimum VmData floor growth for address_space_leak")
+		diagFDPerHour = flag.Float64("diagnose.fd-min-per-hour", 5, "minimum open fd floor growth for fd_leak")
+		diagR2        = flag.Float64("diagnose.r2-min", 0.8, "minimum R2 of a trend fit")
+		diagBusy      = flag.Float64("diagnose.busy-loop-cores", 0.9, "minimum steady cpu cores for cpu_busy_loop")
+		diagMaps      = flag.String("diagnose.maps-groups", "",
+			"regexp of group names whose /proc/pid/maps lines are counted (vs vm.max_map_count)")
+		diagMapsEvery = flag.Duration("diagnose.maps-interval", time.Minute, "how often the maps are counted")
+		man           = flag.Bool("man", false,
 			"print manual")
 		configPath = flag.String("config.path", "",
 			"path to YAML config file")
@@ -242,6 +294,38 @@ func main() {
 		*recheck = true
 	}
 
+	var diagEngine *diagnose.Engine
+	var mapsRe *regexp.Regexp
+	if *diagOn {
+		gre, err := regexp.Compile(*diagGroups)
+		if err != nil {
+			log.Fatalf("bad -diagnose.groups: %v", err)
+		}
+		var dre *regexp.Regexp
+		if *diagDetail != "" {
+			if dre, err = regexp.Compile(*diagDetail); err != nil {
+				log.Fatalf("bad -diagnose.detail-groups: %v", err)
+			}
+		}
+		if *diagMaps != "" {
+			if mapsRe, err = regexp.Compile(*diagMaps); err != nil {
+				log.Fatalf("bad -diagnose.maps-groups: %v", err)
+			}
+		}
+		dcfg := diagnose.Config{
+			Window: *diagWindow, FloorSpan: *diagFloorSpan, Bucket: *diagBucket, MinSpan: *diagMinSpan, Hold: *diagHold,
+			R2Min: *diagR2, LeakMinBytesPerHour: *diagLeakMiB * (1 << 20), VMGrowthMinBytesPerHour: *diagVMMiB * (1 << 20),
+			FDMinPerHour: *diagFDPerHour, BusyLoopCores: *diagBusy,
+			MemAvailable: memAvailable(*procfsPath),
+			MaxMapCount:  readFloat(*procfsPath + "/sys/vm/max_map_count"),
+		}
+		if dre != nil {
+			dcfg.DetailAlways = dre.MatchString
+		}
+		diagEngine = diagnose.New(dcfg, gre)
+		log.Printf("diagnose enabled: groups=%q detail=%q interval=%s window=%s floor-span=%s", *diagGroups, *diagDetail, *diagInterval, *diagWindow, *diagFloorSpan)
+	}
+
 	pc, err := collector.NewProcessCollector(
 		collector.ProcessCollectorOption{
 			ProcFSPath:        *procfsPath,
@@ -253,6 +337,10 @@ func main() {
 			RecheckTimeLimit:  *recheckTimeLimit,
 			Debug:             *debug,
 			RemoveEmptyGroups: *removeEmptyGroups,
+			Diagnose:          diagEngine,
+			DiagnoseInterval:  *diagInterval,
+			MapsGroups:        mapsRe,
+			MapsInterval:      *diagMapsEvery,
 		},
 	)
 	if err != nil {

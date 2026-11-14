@@ -20,6 +20,8 @@ type (
 		// may be blacklisted such that they no longer get tracked by
 		// setting their value in the tracked map to nil.
 		tracked map[ID]*trackedProc
+		// extras holds diagnose-only data of the last Update.
+		extras map[string]GroupExtra
 		// procIds is a map from pid to ProcId.  This is a convenience
 		// to allow finding the Tracked entry of a parent process.
 		procIds map[int]ID
@@ -459,10 +461,13 @@ func (t *Tracker) Update(iter Iter) (CollectErrors, []Update, error) {
 	}
 
 	tp := []Update{}
-	for _, tproc := range t.tracked {
+	extras := make(map[string]GroupExtra)
+	for id, tproc := range t.tracked {
 		if tproc != nil {
 			tp = append(tp, tproc.getUpdate())
+			extras[tproc.groupName] = extraadd(extras[tproc.groupName], id.Pid, tproc.metrics)
 		}
 	}
+	t.extras = extras
 	return colErrs, tp, nil
 }
