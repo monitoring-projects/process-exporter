@@ -347,6 +347,24 @@ Reading `/proc/<pid>/fd`, `io` and `maps` of other users' processes needs root o
 
 `-diagnose` samples the groups in memory and exposes derived `namedprocess_diag_*` series instead of requiring every raw series to be stored: symptoms (`memory_leak_suspected`, `address_space_leak`, `fd_leak`, `thread_leak`, `cpu_busy_loop`, `blocked_io`, `restart_loop`, `maps_near_limit`, `swapping`, fault storms, zombies), a verdict with its driver and rounded evidence as labels, trend slopes, correlations and predicted time to exhaustion. A healthy group emits no per-group series; detail series appear for groups with an active symptom or matching `-diagnose.detail-groups`. Method: per-bucket minimums (removes per-cycle sawtooth), least-squares trends with R2, a sustained-growth check that rejects startup ramps, and a work-vs-time driver from the correlation between floor growth and CPU work. See `diagnose/` and its tests (including a replay of anonymised real data).
 
+## cgroup data (v1, v2 and hybrid)
+
+`-cgroup` reads the cgroup of the processes of each group (path from `/proc/<pid>/cgroup`, files below `-cgroup.root`, default `/sys/fs/cgroup`; in a container mount the host's read-only). Version is detected: v2 when `cgroup.controllers` exists, v1 (also hybrid hosts) when a `memory` controller exists. Processes of a group in several cgroups are summed; limit related values describe the cgroup closest to its memory limit.
+
+| Series (label `groupname`) | Meaning |
+|---|---|
+| `namedprocess_cgroup_info{version,cgroup}` | the cgroup with most processes of the group |
+| `namedprocess_cgroup_memory_bytes{type=usage,limit,non_reclaimable,anon,file,shmem,kernel}` | `limit` only when set; `non_reclaimable` = anon + shmem + unreclaimable kernel (v2) |
+| `namedprocess_cgroup_memory_events_total{event=max,oom_kill}` | limit hits (v1 failcnt) and OOM kills |
+| `namedprocess_cgroup_cpu_usage_seconds_total`, `..._cpu_periods_total`, `..._cpu_throttled_periods_total`, `..._cpu_throttled_seconds_total`, `..._cpu_limit_cores` | CPU use and CFS throttling |
+| `namedprocess_cgroup_pressure_seconds_total{resource,kind}` | pressure stall time per cgroup, v2 only |
+| `namedprocess_cgroup_pids{type=current,limit}` | pids against the pids limit |
+| `namedprocess_host_pressure_seconds_total{resource,kind}` | host PSI from `/proc/pressure` (`-cgroup.host-pressure`, default on) |
+
+Flags: `-cgroup.read-groups` (groups whose cgroups are read, default all), `-cgroup.groups` (groups for which the series are always exposed; others only while a diagnose symptom is active). Counters are sums over the group's cgroups and reset when a cgroup disappears (a restarted container), which `rate()` handles.
+
+With `-diagnose` the cgroup data adds symptoms: `cpu_throttled`, `memory_pressure`, `io_pressure` (v2 PSI), `oom_killed`, `cgroup_memory_near_limit`, `pids_near_limit`, and the memory-leak time to exhaustion is computed against the cgroup limit when one exists (`resource="cgroup_memory"`), with the page-cache share as evidence.
+
 ## Group Thread Metrics
 
 Since publishing thread metrics adds a lot of overhead, use the `-threads` command-line argument to disable them, 

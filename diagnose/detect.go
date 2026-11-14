@@ -22,6 +22,12 @@ const (
 	SymZombies          = "zombie_accumulation"
 	SymRestartLoop      = "restart_loop"
 	SymMapsNearLimit    = "maps_near_limit"
+	SymCPUThrottled     = "cpu_throttled"
+	SymMemoryPressure   = "memory_pressure"
+	SymIOPressure       = "io_pressure"
+	SymOOMKilled        = "oom_killed"
+	SymCgroupNearLimit  = "cgroup_memory_near_limit"
+	SymPidsNearLimit    = "pids_near_limit"
 )
 
 // Finding is one detected symptom with the data that supports it.
@@ -206,6 +212,22 @@ func (g *groupState) trends(ev *Evaluation, full []bucket, cfg *Config) {
 				}
 			}
 		}
+		if l := ev.Latest; l.HasCg {
+			if l.CgFile+l.CgNonReclaim > 0 {
+				f.Evidence["page_cache_share"] = l.CgFile / (l.CgFile + l.CgNonReclaim)
+			}
+			if l.CgLimit > l.CgNonReclaim && l.CgNonReclaim > 0 {
+				eta := time.Duration((l.CgLimit - l.CgNonReclaim) / rss.Slope * float64(time.Hour))
+				f.Evidence["cgroup_limit_bytes"] = l.CgLimit
+				f.Evidence["cgroup_nonreclaimable_bytes"] = l.CgNonReclaim
+				if f.ETA == 0 || eta < f.ETA {
+					f.ETA, f.ETAResource = eta, "cgroup_memory"
+				}
+				if f.ETA < 24*time.Hour {
+					f.Severity = "critical"
+				}
+			}
+		}
 		ev.Findings = append(ev.Findings, f)
 	}
 
@@ -345,6 +367,8 @@ func (g *groupState) rates(ev *Evaluation, cfg *Config) {
 			Confidence: clamp01(share), Evidence: map[string]float64{"blocked_share": share}})
 	}
 
+	g.cgroupRates(ev, cfg, win)
+
 	// Zombies present in every sample of the last ZombieMinAge.
 	zn, zt := 0, 0
 	for _, s := range g.fine {
@@ -358,6 +382,79 @@ func (g *groupState) rates(ev *Evaluation, cfg *Config) {
 	if zt >= 8 && zn == zt && g.fine[0].T.Before(last.T.Add(-cfg.ZombieMinAge*9/10)) {
 		ev.Findings = append(ev.Findings, &Finding{Symptom: SymZombies, Severity: "info", Confidence: 1,
 			Evidence: map[string]float64{"zombies": float64(last.Zombie)}})
+	}
+}
+
+// cgroupRates evaluates the cgroup based detectors on the rate window.
+func (g *groupState) cgroupRates(ev *Evaluation, cfg *Config, win []Sample) {
+	first, last := win[0], win[len(win)-1]
+	if !last.HasCg || !first.HasCg {
+		return
+	}
+	dt := last.T.Sub(first.T).Seconds()
+	if dt <= 0 {
+		return
+	}
+	d := func(a, b float64) float64 {
+		if b < a {
+			return 0
+		}
+		return b - a
+	}
+	if dp := d(first.CgPeriods, last.CgPeriods); dp > 0 {
+		ratio := d(first.CgThrottled, last.CgThrottled) / dp
+		ev.Rates["cgroup_throttled_ratio"] = ratio
+		ev.Rates["cgroup_throttled_seconds_per_sec"] = d(first.CgThrottledSec, last.CgThrottledSec) / dt
+		if ratio >= cfg.ThrottleRatio {
+			ev.Findings = append(ev.Findings, &Finding{Symptom: SymCPUThrottled, Severity: "warning",
+				Confidence: clamp01(ratio / (2 * cfg.ThrottleRatio)),
+				Evidence: map[string]float64{"throttled_period_ratio": ratio, "cpu_limit_cores": last.CgCPULimit,
+					"cpu_cores": ev.Rates["cpu_cores"]}})
+		}
+	}
+	if last.CgPSIMem && first.CgPSIMem {
+		some, full := d(first.CgPSIMemSome, last.CgPSIMemSome)/dt, d(first.CgPSIMemFull, last.CgPSIMemFull)/dt
+		ev.Rates["psi_memory_some_ratio"], ev.Rates["psi_memory_full_ratio"] = some, full
+		if some >= cfg.MemPSISome || full >= cfg.MemPSIFull {
+			sev := "warning"
+			if full >= 5*cfg.MemPSIFull {
+				sev = "critical"
+			}
+			ev.Findings = append(ev.Findings, &Finding{Symptom: SymMemoryPressure, Severity: sev,
+				Confidence: clamp01(math.Max(some/(2*cfg.MemPSISome), full/(2*cfg.MemPSIFull))),
+				Evidence:   map[string]float64{"some_ratio": some, "full_ratio": full}})
+		}
+	}
+	if last.CgPSIIO && first.CgPSIIO {
+		some, full := d(first.CgPSIIOSome, last.CgPSIIOSome)/dt, d(first.CgPSIIOFull, last.CgPSIIOFull)/dt
+		ev.Rates["psi_io_some_ratio"], ev.Rates["psi_io_full_ratio"] = some, full
+		if some >= cfg.IOPSISome || full >= cfg.IOPSIFull {
+			ev.Findings = append(ev.Findings, &Finding{Symptom: SymIOPressure, Severity: "warning",
+				Confidence: clamp01(math.Max(some/(2*cfg.IOPSISome), full/(2*cfg.IOPSIFull))),
+				Evidence:   map[string]float64{"some_ratio": some, "full_ratio": full}})
+		}
+	}
+	if kills := d(g.fine[0].CgOOMKills, last.CgOOMKills); g.fine[0].HasCg && kills > 0 {
+		ev.Findings = append(ev.Findings, &Finding{Symptom: SymOOMKilled, Severity: "critical", Confidence: 1,
+			Evidence: map[string]float64{"oom_kills_in_window": kills, "cgroup_limit_bytes": last.CgLimit}})
+	}
+	near, n := 0, 0
+	for _, s := range win {
+		if s.HasCg && s.CgLimit > 0 {
+			n++
+			if s.CgNonReclaim/s.CgLimit >= cfg.CgroupNearLimit {
+				near++
+			}
+		}
+	}
+	if n >= 8 && near == n {
+		ev.Findings = append(ev.Findings, &Finding{Symptom: SymCgroupNearLimit, Severity: "warning", Confidence: 1,
+			Evidence: map[string]float64{"nonreclaimable_ratio": last.CgNonReclaim / last.CgLimit, "limit_bytes": last.CgLimit,
+				"page_cache_bytes": last.CgFile}})
+	}
+	if last.CgPidsMax > 0 && last.CgPidsCur/last.CgPidsMax >= cfg.PidsNearLimit {
+		ev.Findings = append(ev.Findings, &Finding{Symptom: SymPidsNearLimit, Severity: "warning", Confidence: 1,
+			Evidence: map[string]float64{"pids": last.CgPidsCur, "pids_max": last.CgPidsMax}})
 	}
 }
 

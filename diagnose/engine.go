@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Monitoring-Projects/process-exporter/cgroup"
 	"github.com/Monitoring-Projects/process-exporter/proc"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -76,7 +77,7 @@ func New(cfg Config, groups *regexp.Regexp) *Engine {
 }
 
 // Observe records one sample per analysed group and re-evaluates it.
-func (e *Engine) Observe(now time.Time, groups proc.GroupByName, extras map[string]proc.GroupExtra, maps map[string]int) {
+func (e *Engine) Observe(now time.Time, groups proc.GroupByName, extras map[string]proc.GroupExtra, maps map[string]int, cg map[string]cgroup.Rollup) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	t0 := time.Now()
@@ -118,6 +119,20 @@ func (e *Engine) Observe(now time.Time, groups proc.GroupByName, extras map[stri
 		s.TopWchan = topWchan(g.Wchans)
 		if m, ok := maps[name]; ok {
 			s.MapCount = float64(m)
+		}
+		if r, ok := cg[name]; ok && r.Cgroups > 0 {
+			s.HasCg = true
+			s.CgNonReclaim, s.CgLimit = float64(r.LimitNonReclaim), float64(r.LimitBytes)
+			if r.LimitBytes == 0 {
+				s.CgNonReclaim = float64(r.MemNonReclaim)
+			}
+			s.CgFile, s.CgUsage = float64(r.MemFile), float64(r.MemUsage)
+			s.CgPeriods, s.CgThrottled, s.CgThrottledSec = float64(r.Periods), float64(r.ThrottledPeriods), r.ThrottledSec
+			s.CgOOMKills = float64(r.EventOOMKill)
+			s.CgPSIMem, s.CgPSIMemSome, s.CgPSIMemFull = r.Memory.Valid, r.Memory.SomeSec, r.Memory.FullSec
+			s.CgPSIIO, s.CgPSIIOSome, s.CgPSIIOFull = r.IO.Valid, r.IO.SomeSec, r.IO.FullSec
+			s.CgPidsCur, s.CgPidsMax = float64(r.PidsLimitCur), float64(r.PidsLimit)
+			s.CgCPULimit = r.CPULimitCores
 		}
 		st.add(s, &e.cfg)
 		st.lastEval = evaluate(st, &e.cfg, now)

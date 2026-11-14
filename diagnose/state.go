@@ -49,7 +49,10 @@ type Config struct {
 	MaxMapCount        float64
 	MemAvailable       func() float64
 	MaxGroups          int
-	DetailAlways       func(group string) bool
+	// cgroup based thresholds
+	ThrottleRatio, MemPSISome, MemPSIFull, IOPSISome, IOPSIFull float64
+	CgroupNearLimit, PidsNearLimit                              float64
+	DetailAlways                                                func(group string) bool
 }
 
 func (c *Config) defaults() {
@@ -86,6 +89,13 @@ func (c *Config) defaults() {
 	f(&c.MajorFaultsPerSec, 20)
 	f(&c.BlockedShare, 0.8)
 	f(&c.MapsNearLimitRatio, 0.8)
+	f(&c.ThrottleRatio, 0.25)
+	f(&c.MemPSISome, 0.10)
+	f(&c.MemPSIFull, 0.02)
+	f(&c.IOPSISome, 0.20)
+	f(&c.IOPSIFull, 0.05)
+	f(&c.CgroupNearLimit, 0.90)
+	f(&c.PidsNearLimit, 0.80)
 	if c.RestartLoopCount == 0 {
 		c.RestartLoopCount = 3
 	}
@@ -109,8 +119,19 @@ type Sample struct {
 	CPU, CtxVol, CtxNonvol, MinFlt, MajFlt, IOBytes float64
 
 	Running, Sleeping, Blocked, Zombie int
-	TopWchan                           string
-	Start                              int64
+
+	// cgroup data (HasCg false when not collected)
+	HasCg                                  bool
+	CgNonReclaim, CgLimit, CgFile, CgUsage float64
+	CgPeriods, CgThrottled, CgOOMKills     float64
+	CgThrottledSec                         float64
+	CgPSIMemSome, CgPSIMemFull             float64
+	CgPSIIOSome, CgPSIIOFull               float64
+	CgPSIMem, CgPSIIO                      bool
+	CgPidsCur, CgPidsMax                   float64
+	CgCPULimit                             float64
+	TopWchan                               string
+	Start                                  int64
 }
 
 // anon returns the anonymous resident size, falling back to RSS when the

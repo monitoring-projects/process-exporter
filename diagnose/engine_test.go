@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Monitoring-Projects/process-exporter/cgroup"
 	"github.com/Monitoring-Projects/process-exporter/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -18,6 +19,7 @@ type gen struct {
 	blocked                       bool
 	volRate                       float64
 	restartAt                     []time.Duration
+	cg                            func(el time.Duration) cgroup.Rollup
 }
 
 const mib = 1 << 20
@@ -66,7 +68,11 @@ func run(t *testing.T, g gen, span time.Duration, cfg Config) (*Engine, time.Tim
 		ex := proc.GroupExtra{
 			Ext: proc.MemoryExt{RssAnonBytes: uint64(f(g.rssAnon, 100*mib)), VmDataBytes: uint64(f(g.vmData, 500*mib))}, FDLimitMin: 1024,
 		}
-		e.Observe(t0.Add(el), proc.GroupByName{"svc": grp}, map[string]proc.GroupExtra{"svc": ex}, nil)
+		var cgm map[string]cgroup.Rollup
+		if g.cg != nil {
+			cgm = map[string]cgroup.Rollup{"svc": g.cg(el)}
+		}
+		e.Observe(t0.Add(el), proc.GroupByName{"svc": grp}, map[string]proc.GroupExtra{"svc": ex}, nil, cgm)
 	}
 	return e, t0.Add(span)
 }
@@ -289,8 +295,8 @@ func TestShortLivedChurnIsNotARestartLoop(t *testing.T) {
 		now := t0.Add(time.Duration(i) * 5 * time.Second)
 		// a new 5 s lived process every sample, as a shell loop running sleep
 		grp := proc.Group{Procs: 1, OldestStartTime: now}
-		e.Observe(now, proc.GroupByName{"sleep": grp}, nil, nil)
-		e.Observe(now.Add(3*time.Second), proc.GroupByName{"sleep": proc.Group{}}, nil, nil)
+		e.Observe(now, proc.GroupByName{"sleep": grp}, nil, nil, nil)
+		e.Observe(now.Add(3*time.Second), proc.GroupByName{"sleep": proc.Group{}}, nil, nil, nil)
 	}
 	if fl := e.Flagged(t0.Add(40 * time.Minute)); len(fl) != 0 {
 		t.Fatalf("short-lived churn flagged: %v", fl["sleep"][0])
@@ -308,5 +314,81 @@ func TestStartupRampThenPlateauIsNotALeak(t *testing.T) {
 	e, now := run(t, g, 6*time.Hour, Config{})
 	if f := findings(e, now)["memory_leak_suspected"]; f != nil {
 		t.Fatalf("startup ramp flagged as leak: %v", f.Evidence)
+	}
+}
+
+func TestCPUThrottled(t *testing.T) {
+	g := gen{cg: func(el time.Duration) cgroup.Rollup {
+		periods := uint64(el.Seconds() * 10) // 100 ms periods
+		return cgroup.Rollup{Cgroups: 1, Periods: periods, ThrottledPeriods: periods / 2, CPULimitCores: 1}
+	}}
+	e, now := run(t, g, 20*time.Minute, Config{})
+	f := findings(e, now)["cpu_throttled"]
+	if f == nil || f.Evidence["throttled_period_ratio"] < 0.45 {
+		t.Fatalf("cpu throttling not detected: %+v", f)
+	}
+}
+
+func TestNotThrottledBelowThreshold(t *testing.T) {
+	g := gen{cg: func(el time.Duration) cgroup.Rollup {
+		periods := uint64(el.Seconds() * 10)
+		return cgroup.Rollup{Cgroups: 1, Periods: periods, ThrottledPeriods: periods / 20}
+	}}
+	e, now := run(t, g, 20*time.Minute, Config{})
+	if findings(e, now)["cpu_throttled"] != nil {
+		t.Fatal("5 percent throttling flagged")
+	}
+}
+
+func TestMemoryPressureAndOOMKill(t *testing.T) {
+	g := gen{cg: func(el time.Duration) cgroup.Rollup {
+		r := cgroup.Rollup{Cgroups: 1, Memory: cgroup.PSI{Valid: true, SomeSec: el.Seconds() * 0.2, FullSec: el.Seconds() * 0.12}}
+		if el > 10*time.Minute {
+			r.EventOOMKill = 1
+		}
+		return r
+	}}
+	e, now := run(t, g, 20*time.Minute, Config{})
+	f := findings(e, now)
+	if f["memory_pressure"] == nil || f["memory_pressure"].Severity != "critical" {
+		t.Fatalf("memory pressure: %+v", f["memory_pressure"])
+	}
+	if f["oom_killed"] == nil {
+		t.Fatal("oom kill not detected")
+	}
+}
+
+func TestCgroupNearLimitAndLeakETAFromLimit(t *testing.T) {
+	// 30 MiB/h leak, 4 GiB limit, 3.8 GiB non-reclaimable now: ETA hours, not host-memory days.
+	g := gen{
+		rssAnon: func(el time.Duration) float64 { return 3800*mib + 30*mib*(el.Hours()-8) },
+		cg: func(el time.Duration) cgroup.Rollup {
+			return cgroup.Rollup{Cgroups: 1, LimitBytes: 4096 * mib, LimitNonReclaim: uint64(3800*mib + 30*mib*(el.Hours()-8)), MemFile: uint64(200 * mib)}
+		},
+	}
+	e, now := run(t, g, 8*time.Hour, Config{})
+	f := findings(e, now)
+	if f["cgroup_memory_near_limit"] == nil {
+		t.Fatalf("near limit not detected: %v", e.Flagged(now))
+	}
+	leak := f["memory_leak_suspected"]
+	if leak == nil || leak.ETAResource != "cgroup_memory" {
+		t.Fatalf("leak ETA must use the cgroup limit: %+v", leak)
+	}
+	if want := (4096.0 - 3800) / 30; leak.ETA.Hours() < want-3 || leak.ETA.Hours() > want+3 {
+		t.Errorf("eta %.1f h, want about %.1f h", leak.ETA.Hours(), want)
+	}
+	if leak.Severity != "critical" {
+		t.Errorf("severity %s, want critical (under 24 h)", leak.Severity)
+	}
+}
+
+func TestPidsNearLimit(t *testing.T) {
+	g := gen{cg: func(time.Duration) cgroup.Rollup {
+		return cgroup.Rollup{Cgroups: 1, PidsLimitCur: 90, PidsLimit: 100}
+	}}
+	e, now := run(t, g, 20*time.Minute, Config{})
+	if findings(e, now)["pids_near_limit"] == nil {
+		t.Fatal("pids near limit not detected")
 	}
 }

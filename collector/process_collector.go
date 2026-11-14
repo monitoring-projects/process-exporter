@@ -10,6 +10,7 @@ import (
 	"time"
 
 	common "github.com/Monitoring-Projects/process-exporter"
+	"github.com/Monitoring-Projects/process-exporter/cgroup"
 	"github.com/Monitoring-Projects/process-exporter/diagnose"
 	"github.com/Monitoring-Projects/process-exporter/proc"
 	"github.com/prometheus/client_golang/prometheus"
@@ -136,6 +137,35 @@ var (
 		[]string{"groupname", "type"},
 		nil)
 
+	cgInfoDesc = prometheus.NewDesc("namedprocess_cgroup_info",
+		"cgroup of the group's processes (the one with most processes) and the cgroup version",
+		[]string{"groupname", "version", "cgroup"}, nil)
+	cgMemDesc = prometheus.NewDesc("namedprocess_cgroup_memory_bytes",
+		"cgroup memory (usage, limit if set, non_reclaimable = anon+shmem+kernel, anon, file, shmem, kernel), summed over the group's cgroups",
+		[]string{"groupname", "type"}, nil)
+	cgEventsDesc = prometheus.NewDesc("namedprocess_cgroup_memory_events_total",
+		"cgroup memory events: max (limit hit, v1 failcnt) and oom_kill",
+		[]string{"groupname", "event"}, nil)
+	cgCPUDesc = prometheus.NewDesc("namedprocess_cgroup_cpu_usage_seconds_total",
+		"cgroup CPU time", []string{"groupname"}, nil)
+	cgPeriodsDesc = prometheus.NewDesc("namedprocess_cgroup_cpu_periods_total",
+		"CFS enforcement periods", []string{"groupname"}, nil)
+	cgThrottledDesc = prometheus.NewDesc("namedprocess_cgroup_cpu_throttled_periods_total",
+		"CFS periods in which the cgroup was throttled", []string{"groupname"}, nil)
+	cgThrottledSecDesc = prometheus.NewDesc("namedprocess_cgroup_cpu_throttled_seconds_total",
+		"time the cgroup was throttled", []string{"groupname"}, nil)
+	cgCPULimitDesc = prometheus.NewDesc("namedprocess_cgroup_cpu_limit_cores",
+		"CPU quota in cores (absent when unlimited)", []string{"groupname"}, nil)
+	cgPressureDesc = prometheus.NewDesc("namedprocess_cgroup_pressure_seconds_total",
+		"cgroup v2 pressure stall time by resource (cpu, memory, io) and kind (some, full)",
+		[]string{"groupname", "resource", "kind"}, nil)
+	cgPidsDesc = prometheus.NewDesc("namedprocess_cgroup_pids",
+		"pids.current and the pids limit (type=current|limit) of the cgroup closest to its limit",
+		[]string{"groupname", "type"}, nil)
+	hostPressureDesc = prometheus.NewDesc("namedprocess_host_pressure_seconds_total",
+		"host pressure stall time from /proc/pressure by resource and kind",
+		[]string{"resource", "kind"}, nil)
+
 	scrapeErrorsDesc = prometheus.NewDesc(
 		"namedprocess_scrape_errors",
 		"general scrape errors: no proc metrics collected during a cycle",
@@ -240,6 +270,15 @@ type (
 		// group that never matched is reported with zero processes.
 		StaticNames   []string
 		ReportMissing bool
+
+		// Cgroup, when non-nil, reads cgroup v1/v2 data of the processes of
+		// the groups matching CgroupReadGroups (feeds the diagnose engine).
+		// The metrics are exposed for groups matching CgroupGroups and for
+		// groups with an active diagnose symptom.
+		Cgroup             *cgroup.Reader
+		CgroupReadGroups   *regexp.Regexp
+		CgroupGroups       *regexp.Regexp
+		CgroupHostPressure bool
 	}
 
 	NamedProcessCollector struct {
@@ -271,6 +310,14 @@ type (
 		staticNames   []string
 		reportMissing bool
 		maxMapCount   float64
+
+		cg        *cgroup.Reader
+		cgRead    *regexp.Regexp
+		cgExpose  *regexp.Regexp
+		cgHostPSI bool
+		cgCache   map[string]cgroup.Rollup
+		cgLast    time.Time
+		cgMaxPids int
 	}
 )
 
@@ -305,6 +352,12 @@ func NewProcessCollector(options ProcessCollectorOption) (*NamedProcessCollector
 		filter:        newExportFilter(options.ExportMinResident, options.ExportMinCores, options.ExportHold),
 		staticNames:   options.StaticNames,
 		reportMissing: options.ReportMissing,
+
+		cg:        options.Cgroup,
+		cgRead:    options.CgroupReadGroups,
+		cgExpose:  options.CgroupGroups,
+		cgHostPSI: options.CgroupHostPressure,
+		cgMaxPids: 16,
 	}
 	if options.MapsGroups != nil {
 		p.maxMapCount = readFloatFile(options.ProcFSPath + "/sys/vm/max_map_count")
@@ -357,6 +410,10 @@ func (p *NamedProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- exitedDesc
 	ch <- newestStartDesc
 	ch <- fdByTypeDesc
+	for _, d := range []*prometheus.Desc{cgInfoDesc, cgMemDesc, cgEventsDesc, cgCPUDesc, cgPeriodsDesc, cgThrottledDesc,
+		cgThrottledSecDesc, cgCPULimitDesc, cgPressureDesc, cgPidsDesc, hostPressureDesc} {
+		ch <- d
+	}
 	if p.diag != nil {
 		p.diag.Describe(ch)
 	}
@@ -407,7 +464,7 @@ func (p *NamedProcessCollector) observe(groups proc.GroupByName) {
 	if p.diag == nil {
 		return
 	}
-	p.diag.Observe(time.Now(), groups, p.Grouper.Extras(), maps)
+	p.diag.Observe(time.Now(), groups, p.Grouper.Extras(), maps, p.cgRollups(groups))
 }
 
 // fdTypes refreshes the file descriptor type breakdown of the selected groups.
@@ -423,6 +480,71 @@ func (p *NamedProcessCollector) fdTypes() {
 		}
 	}
 	p.fdCache = res
+}
+
+// cgRollups reads the cgroups of the processes of the selected groups, at
+// most once per two seconds.
+func (p *NamedProcessCollector) cgRollups(groups proc.GroupByName) map[string]cgroup.Rollup {
+	if p.cg == nil || p.cg.Version() == "" {
+		return nil
+	}
+	if time.Since(p.cgLast) < 2*time.Second && p.cgCache != nil {
+		return p.cgCache
+	}
+	p.cgLast = time.Now()
+	p.cg.Refresh()
+	res := map[string]cgroup.Rollup{}
+	for name, x := range p.Grouper.Extras() {
+		if p.cgRead != nil && !p.cgRead.MatchString(name) {
+			continue
+		}
+		if st := p.cg.ForPids(x.Pids, p.cgMaxPids); len(st) > 0 {
+			res[name] = cgroup.Combine(st)
+		}
+	}
+	p.cgCache = res
+	return res
+}
+
+func (p *NamedProcessCollector) emitCgroup(ch chan<- prometheus.Metric, gname string, r cgroup.Rollup) {
+	g := func(d *prometheus.Desc, v float64, l ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, append([]string{gname}, l...)...)
+	}
+	c := func(d *prometheus.Desc, v float64, l ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, v, append([]string{gname}, l...)...)
+	}
+	g(cgInfoDesc, 1, r.Version, utf8(r.Primary))
+	g(cgMemDesc, float64(r.MemUsage), "usage")
+	if r.LimitBytes > 0 {
+		g(cgMemDesc, float64(r.LimitBytes), "limit")
+	}
+	g(cgMemDesc, float64(r.MemNonReclaim), "non_reclaimable")
+	g(cgMemDesc, float64(r.MemAnon), "anon")
+	g(cgMemDesc, float64(r.MemFile), "file")
+	g(cgMemDesc, float64(r.MemShmem), "shmem")
+	g(cgMemDesc, float64(r.MemKernel), "kernel")
+	c(cgEventsDesc, float64(r.EventMax), "max")
+	c(cgEventsDesc, float64(r.EventOOMKill), "oom_kill")
+	c(cgCPUDesc, r.CPUUsageSec)
+	c(cgPeriodsDesc, float64(r.Periods))
+	c(cgThrottledDesc, float64(r.ThrottledPeriods))
+	c(cgThrottledSecDesc, r.ThrottledSec)
+	if r.CPULimitCores > 0 {
+		g(cgCPULimitDesc, r.CPULimitCores)
+	}
+	for _, x := range []struct {
+		res string
+		psi cgroup.PSI
+	}{{"cpu", r.CPU}, {"memory", r.Memory}, {"io", r.IO}} {
+		if x.psi.Valid {
+			c(cgPressureDesc, x.psi.SomeSec, x.res, "some")
+			c(cgPressureDesc, x.psi.FullSec, x.res, "full")
+		}
+	}
+	if r.PidsLimit > 0 {
+		g(cgPidsDesc, float64(r.PidsLimitCur), "current")
+		g(cgPidsDesc, float64(r.PidsLimit), "limit")
+	}
 }
 
 func readFloatFile(path string) float64 {
@@ -489,6 +611,10 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 		now := time.Now()
 		p.filter.forget(now)
 		extras, lifecycle := p.Grouper.Extras(), p.Grouper.Lifecycle()
+		var flagged map[string][]*diagnose.Finding
+		if p.diag != nil {
+			flagged = p.diag.Flagged(now)
+		}
 		for gname, gcounts := range groups {
 			if !p.filter.allow(gname, gcounts.Memory.ResidentBytes, gcounts.CPUUserTime+gcounts.CPUSystemTime, now) {
 				continue
@@ -576,6 +702,12 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 			for typ, n := range p.fdCache[rawName] {
 				ch <- prometheus.MustNewConstMetric(fdByTypeDesc, prometheus.GaugeValue, float64(n), gname, typ)
 			}
+			if r, ok := p.cgCache[rawName]; ok && p.cgExpose != nil {
+				_, flag := flagged[rawName]
+				if flag || p.cgExpose.MatchString(rawName) {
+					p.emitCgroup(ch, gname, r)
+				}
+			}
 
 			if p.smaps {
 				ch <- prometheus.MustNewConstMetric(membytesDesc,
@@ -614,6 +746,18 @@ func (p *NamedProcessCollector) scrape(ch chan<- prometheus.Metric) {
 						prometheus.CounterValue, float64(thr.CtxSwitchNonvoluntary),
 						gname, utf8(thr.Name), "nonvoluntary")
 				}
+			}
+		}
+	}
+	if p.cg != nil && p.cgHostPSI {
+		cpu, mem, io := cgroup.ReadHostPSI(p.procfs)
+		for _, x := range []struct {
+			res string
+			psi cgroup.PSI
+		}{{"cpu", cpu}, {"memory", mem}, {"io", io}} {
+			if x.psi.Valid {
+				ch <- prometheus.MustNewConstMetric(hostPressureDesc, prometheus.CounterValue, x.psi.SomeSec, x.res, "some")
+				ch <- prometheus.MustNewConstMetric(hostPressureDesc, prometheus.CounterValue, x.psi.FullSec, x.res, "full")
 			}
 		}
 	}

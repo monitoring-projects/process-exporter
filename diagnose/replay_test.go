@@ -62,7 +62,7 @@ func TestReplayRealLeakAndFlatWorkload(t *testing.T) {
 			return proc.GroupExtra{Ext: proc.MemoryExt{RssAnonBytes: uint64(mib * mib_)}}
 		}
 		e.Observe(r.t, proc.GroupByName{"leaky": g(r.leaky, startLeaky), "steady": g(r.steady, startSteady)},
-			map[string]proc.GroupExtra{"leaky": x(r.leaky), "steady": x(r.steady)}, nil)
+			map[string]proc.GroupExtra{"leaky": x(r.leaky), "steady": x(r.steady)}, nil, nil)
 		fl := e.Flagged(r.t)
 		for _, ff := range fl["leaky"] {
 			if ff.Symptom == SymMemoryLeak {

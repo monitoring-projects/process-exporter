@@ -15,6 +15,7 @@ import (
 	"time"
 
 	common "github.com/Monitoring-Projects/process-exporter"
+	"github.com/Monitoring-Projects/process-exporter/cgroup"
 	"github.com/Monitoring-Projects/process-exporter/collector"
 	"github.com/Monitoring-Projects/process-exporter/config"
 	"github.com/Monitoring-Projects/process-exporter/diagnose"
@@ -216,7 +217,14 @@ func main() {
 		exportHold     = flag.Duration("export.hold", 30*time.Minute, "keep exporting a group this long after it last passed the export thresholds")
 		reportMissing  = flag.Bool("report-missing", false,
 			"with -config.path: report namedprocess_namegroup_num_procs 0 for groups with a static name that never matched")
-		diagOn = flag.Bool("diagnose", false,
+		cgOn = flag.Bool("cgroup", false,
+			"read cgroup v1/v2 data (memory, CPU throttling, pids, pressure) of the processes' cgroups; feeds the diagnose engine and namedprocess_cgroup_*")
+		cgRoot   = flag.String("cgroup.root", "/sys/fs/cgroup", "cgroup file system root (in a container the host's, mounted read-only)")
+		cgRead   = flag.String("cgroup.read-groups", ".+", "regexp of group names whose cgroups are read")
+		cgExpose = flag.String("cgroup.groups", "",
+			"regexp of group names for which namedprocess_cgroup_* are always exposed (others only while a diagnose symptom is active)")
+		cgHostPSI = flag.Bool("cgroup.host-pressure", true, "with -cgroup: expose /proc/pressure as namedprocess_host_pressure_seconds_total")
+		diagOn    = flag.Bool("diagnose", false,
 			"sample selected groups over time, correlate the signals and expose symptoms and predictions (namedprocess_diag_*)")
 		diagGroups = flag.String("diagnose.groups", ".+",
 			"regexp of group names that are analysed in memory")
@@ -313,7 +321,25 @@ func main() {
 	}
 
 	var diagEngine *diagnose.Engine
-	var mapsRe, fdRe *regexp.Regexp
+	var mapsRe, fdRe, cgReadRe, cgExposeRe *regexp.Regexp
+	var cgReader *cgroup.Reader
+	if *cgOn {
+		var err error
+		if cgReadRe, err = regexp.Compile(*cgRead); err != nil {
+			log.Fatalf("bad -cgroup.read-groups: %v", err)
+		}
+		if *cgExpose != "" {
+			if cgExposeRe, err = regexp.Compile(*cgExpose); err != nil {
+				log.Fatalf("bad -cgroup.groups: %v", err)
+			}
+		}
+		cgReader = cgroup.NewReader(*cgRoot, *procfsPath)
+		if cgReader.Version() == "" {
+			log.Printf("cgroup: no cgroup v1 or v2 hierarchy found below %s, cgroup data disabled", *cgRoot)
+		} else {
+			log.Printf("cgroup %s read from %s", cgReader.Version(), *cgRoot)
+		}
+	}
 	if *mapsGroups == "" {
 		*mapsGroups = *diagMaps
 	}
@@ -359,29 +385,33 @@ func main() {
 
 	pc, err := collector.NewProcessCollector(
 		collector.ProcessCollectorOption{
-			ProcFSPath:        *procfsPath,
-			Children:          *children,
-			Threads:           *threads,
-			GatherSMaps:       *smaps,
-			Namer:             matchnamer,
-			Recheck:           *recheck,
-			RecheckTimeLimit:  *recheckTimeLimit,
-			Debug:             *debug,
-			RemoveEmptyGroups: *removeEmptyGroups,
-			Diagnose:          diagEngine,
-			DiagnoseInterval:  *diagInterval,
-			MapsGroups:        mapsRe,
-			MapsInterval:      *mapsEvery,
-			MemoryBreakdown:   *memBreakdown,
-			GatherDelay:       *gatherDelay,
-			GatherLifecycle:   *gatherLifecycle,
-			FDGroups:          fdRe,
-			FDInterval:        *fdEvery,
-			ExportMinResident: *exportMinRSS,
-			ExportMinCores:    *exportMinCores,
-			ExportHold:        *exportHold,
-			StaticNames:       staticNames,
-			ReportMissing:     *reportMissing,
+			ProcFSPath:         *procfsPath,
+			Children:           *children,
+			Threads:            *threads,
+			GatherSMaps:        *smaps,
+			Namer:              matchnamer,
+			Recheck:            *recheck,
+			RecheckTimeLimit:   *recheckTimeLimit,
+			Debug:              *debug,
+			RemoveEmptyGroups:  *removeEmptyGroups,
+			Diagnose:           diagEngine,
+			DiagnoseInterval:   *diagInterval,
+			MapsGroups:         mapsRe,
+			MapsInterval:       *mapsEvery,
+			MemoryBreakdown:    *memBreakdown,
+			GatherDelay:        *gatherDelay,
+			GatherLifecycle:    *gatherLifecycle,
+			FDGroups:           fdRe,
+			FDInterval:         *fdEvery,
+			ExportMinResident:  *exportMinRSS,
+			ExportMinCores:     *exportMinCores,
+			ExportHold:         *exportHold,
+			StaticNames:        staticNames,
+			ReportMissing:      *reportMissing,
+			Cgroup:             cgReader,
+			CgroupReadGroups:   cgReadRe,
+			CgroupGroups:       cgExposeRe,
+			CgroupHostPressure: *cgHostPSI,
 		},
 	)
 	if err != nil {
